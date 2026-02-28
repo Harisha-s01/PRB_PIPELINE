@@ -1,75 +1,79 @@
 import os
 import pdfplumber
 from docx import Document
-import pandas as pd
-from PIL import Image
-import pytesseract
-import io
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
 
 class DocumentProcessor:
     def __init__(self):
-        self.supported_formats = {
-            'pdf': self._process_pdf,
-            'docx': self._process_docx,
-            'xlsx': self._process_excel,
-            'png': self._process_image,
-            'jpg': self._process_image,
-            'jpeg': self._process_image
-        }
+        # Lightweight embedding model (good quality + fast)
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
 
-    def process_file(self, file):
-        """Process uploaded file based on its extension"""
-        file_extension = file.name.split('.')[-1].lower()
-        if file_extension in self.supported_formats:
-            return self.supported_formats[file_extension](file)
+        # Smart chunking
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100
+        )
+
+    def extract_text(self, file_path):
+        """
+        Extract text from PDF or DOCX file
+        """
+        # Streamlit `uploaded_file` is a buffer with a .name attribute, not
+        # a filesystem path.  Accept either a path string or a file-like
+        # object.  Determine the extension from the filename when possible.
+        filename = getattr(file_path, "name", None)
+        if filename:
+            ext = os.path.splitext(filename)[1].lower()
+        elif isinstance(file_path, str):
+            ext = os.path.splitext(file_path)[1].lower()
         else:
-            raise ValueError(f"Unsupported file format: {file_extension}")
+            ext = None
 
-    def _process_pdf(self, file):
-        """Extract text and tables from PDF"""
-        texts, tables = [], []
-        with pdfplumber.open(file) as pdf:
-            for i, page in enumerate(pdf.pages, start=1):
-                txt = page.extract_text() or ""
-                texts.append({
-                    "text": txt,
-                    "source": file.name,
-                    "page": i
-                })
-                # Extract tables
-                for ti, table in enumerate(page.extract_tables(), start=1):
-                    if table:
-                        df = pd.DataFrame(table[1:], columns=table[0])
-                        tables.append({
-                            "df": df,
-                            "source": file.name,
-                            "page": i,
-                            "table_id": f"{i}-{ti}"
-                        })
-        return texts, tables
+        if ext == ".pdf":
+            return self._extract_pdf(file_path)
+        elif ext == ".docx":
+            return self._extract_docx(file_path)
+        else:
+            raise ValueError("Unsupported file format. Use PDF or DOCX.")
 
-    def _process_docx(self, file):
-        """Extract text from DOCX"""
-        doc = Document(io.BytesIO(file.read()))
-        text = "\n".join([p.text for p in doc.paragraphs])
-        return [{"text": text, "source": file.name, "page": 1}], []
+    def _extract_pdf(self, file_path):
+        text = ""
+        # pdfplumber.open accepts both path strings and file-like objects
+        # containing PDF data, which covers the Streamlit upload case.
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+        return text
 
-    def _process_excel(self, file):
-        """Extract tables from Excel"""
-        tables = []
-        xls = pd.ExcelFile(file)
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet)
-            tables.append({
-                "df": df,
-                "source": file.name,
-                "sheet": sheet,
-                "table_id": sheet
-            })
-        return [], tables
+    def _extract_docx(self, file_path):
+        doc = Document(file_path)
+        return "\n".join([para.text for para in doc.paragraphs])
 
-    def _process_image(self, file):
-        """Extract text from images using OCR"""
-        image = Image.open(io.BytesIO(file.read()))
-        text = pytesseract.image_to_string(image)
-        return [{"text": text, "source": file.name, "page": 1}], []
+    def create_vector_store(self, text):
+        """
+        Split text → Create embeddings → Store in FAISS
+        """
+        # `text` may be a list of pre-split chunks (as used by the Streamlit
+        # app) or a raw string.  Accept both for backwards compatibility.
+        if isinstance(text, list):
+            chunks = text
+        else:
+            chunks = self.text_splitter.split_text(text)
+
+        vector_store = FAISS.from_texts(
+            texts=chunks,
+            embedding=self.embeddings
+        )
+
+        return vector_store
+
+    def chunk_text(self, text):
+        """Return a list of text chunks generated by the splitter."""
+
+        return self.text_splitter.split_text(text)
